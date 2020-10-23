@@ -1,31 +1,30 @@
 package hystrix
 
 import (
+	"context"
 	"testing"
 
 	"github.com/afex/hystrix-go/hystrix"
-	"github.com/micro/go-micro/client"
-	"github.com/micro/go-micro/registry/mock"
-	"github.com/micro/go-micro/selector"
-
-	"context"
+	"github.com/micro/go-micro/v2/client"
+	"github.com/micro/go-micro/v2/registry/memory"
+	"github.com/micro/go-micro/v2/router"
+	rrouter "github.com/micro/go-micro/v2/router/registry"
 )
 
 func TestBreaker(t *testing.T) {
 	// setup
-	r := mock.NewRegistry()
-	s := selector.NewSelector(selector.Registry(r))
+	registry := memory.NewRegistry()
 
 	c := client.NewClient(
 		// set the selector
-		client.Selector(s),
+		client.Router(rrouter.NewRouter(router.Registry(registry))),
 		// add the breaker wrapper
 		client.Wrap(NewClientWrapper()),
 	)
 
-	req := c.NewJsonRequest("test.service", "Test.Method", map[string]string{
+	req := c.NewRequest("test.service", "Test.Method", map[string]string{
 		"foo": "bar",
-	})
+	}, client.WithContentType("application/json"))
 
 	var rsp map[string]interface{}
 

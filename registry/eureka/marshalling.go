@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	"github.com/hudl/fargo"
-	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/v2/registry"
 )
 
 func appToService(app *fargo.Application) []*registry.Service {
@@ -23,18 +25,15 @@ func appToService(app *fargo.Application) []*registry.Service {
 		var endpoints []*registry.Endpoint
 
 		// get version
-		k, err := instance.Metadata.GetString("version")
-		if err != nil {
+		if _, err := instance.Metadata.GetString("version"); err != nil {
 			continue
 		}
 
-		k, err = instance.Metadata.GetString("endpoints")
-		if err == nil {
+		if k, err := instance.Metadata.GetString("endpoints"); err == nil {
 			json.Unmarshal([]byte(k), &endpoints)
 		}
 
-		k, err = instance.Metadata.GetString("metadata")
-		if err == nil {
+		if k, err := instance.Metadata.GetString("metadata"); err == nil {
 			json.Unmarshal([]byte(k), &metadata)
 		}
 
@@ -49,11 +48,12 @@ func appToService(app *fargo.Application) []*registry.Service {
 			}
 		}
 
+                host, _, _ := net.SplitHostPort(addr)
+
 		// append node
 		service.Nodes = append(service.Nodes, &registry.Node{
 			Id:       id,
-			Address:  addr,
-			Port:     port,
+			Address:  fmt.Sprintf("%s:%d", host, port),
 			Metadata: metadata,
 		})
 
@@ -61,8 +61,7 @@ func appToService(app *fargo.Application) []*registry.Service {
 		serviceMap[version] = service
 	}
 
-	var services []*registry.Service
-
+	services := make([]*registry.Service, 0, len(serviceMap))
 	for _, service := range serviceMap {
 		services = append(services, service)
 	}
@@ -77,6 +76,8 @@ func serviceToInstance(service *registry.Service) (*fargo.Instance, error) {
 	}
 
 	node := service.Nodes[0]
+	_, pt, _ := net.SplitHostPort(node.Address)
+	port, _ := strconv.Atoi(pt)
 
 	instance := &fargo.Instance{
 		App:              service.Name,
@@ -84,7 +85,7 @@ func serviceToInstance(service *registry.Service) (*fargo.Instance, error) {
 		IPAddr:           node.Address,
 		VipAddress:       node.Address,
 		SecureVipAddress: node.Address,
-		Port:             node.Port,
+		Port:             port,
 		Status:           fargo.UP,
 		UniqueID: func(i fargo.Instance) string {
 			return fmt.Sprintf("%s:%s", node.Address, node.Id)

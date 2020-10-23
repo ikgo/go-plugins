@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/micro/go-micro/codec"
+	"github.com/micro/go-micro/v2/codec"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -36,8 +36,8 @@ func (c *msgpackCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error 
 		}
 
 		c.body = h.hasBody
-		m.Id = uint64(h.ID)
-		m.Method = h.Method
+		m.Id = h.ID
+		m.Endpoint = h.Method
 
 	case codec.Response:
 		var h Response
@@ -47,10 +47,10 @@ func (c *msgpackCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error 
 		}
 
 		c.body = h.hasBody
-		m.Id = uint64(h.ID)
+		m.Id = h.ID
 		m.Error = h.Error
 
-	case codec.Publication:
+	case codec.Event:
 		var h Notification
 
 		if err := msgp.Decode(c.rwc, &h); err != nil {
@@ -58,7 +58,7 @@ func (c *msgpackCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error 
 		}
 
 		c.body = h.hasBody
-		m.Method = h.Method
+		m.Endpoint = h.Method
 
 	default:
 		return errors.New("Unrecognized message type")
@@ -82,7 +82,7 @@ func (c *msgpackCodec) ReadBody(v interface{}) error {
 	}
 
 	switch c.mt {
-	case codec.Request, codec.Response, codec.Publication:
+	case codec.Request, codec.Response, codec.Event:
 		return decodeBody(r, v)
 	default:
 		return fmt.Errorf("Unrecognized message type: %v", c.mt)
@@ -95,8 +95,8 @@ func (c *msgpackCodec) Write(m *codec.Message, b interface{}) error {
 	switch m.Type {
 	case codec.Request:
 		h := Request{
-			ID:     uint32(m.Id),
-			Method: m.Method,
+			ID:     m.Id,
+			Method: m.Endpoint,
 			Body:   b,
 		}
 
@@ -104,7 +104,7 @@ func (c *msgpackCodec) Write(m *codec.Message, b interface{}) error {
 
 	case codec.Response:
 		h := Response{
-			ID:   uint32(m.Id),
+			ID:   m.Id,
 			Body: b,
 		}
 
@@ -112,9 +112,9 @@ func (c *msgpackCodec) Write(m *codec.Message, b interface{}) error {
 
 		return msgp.Encode(c.rwc, &h)
 
-	case codec.Publication:
+	case codec.Event:
 		h := Notification{
-			Method: m.Method,
+			Method: m.Endpoint,
 			Body:   b,
 		}
 

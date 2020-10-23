@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	"github.com/go-log/log"
-	"github.com/micro/go-micro/server"
-	"github.com/micro/go-micro/transport"
-	"github.com/nats-io/nats"
+	"github.com/micro/go-micro/v2/server"
+	"github.com/micro/go-micro/v2/transport"
+	"github.com/nats-io/nats.go"
 )
 
 var addrTestCases = []struct {
@@ -34,7 +34,7 @@ var addrTestCases = []struct {
 		"default",
 		"check if default Address is set correctly",
 		map[string]string{
-			"nats://localhost:4222": ""},
+			"nats://127.0.0.1:4222": ""},
 	},
 }
 

@@ -1,17 +1,16 @@
-// Package http provides a http transport
+// Package http returns a http2 transport using net/http
 package http
 
 import (
-	"github.com/micro/go-micro/transport"
-	"github.com/micro/go-micro/transport/http"
+	"github.com/micro/go-micro/v2/cmd"
+	"github.com/micro/go-micro/v2/transport"
 )
 
-/*
-	HTTP transport is the default synchronous communication mechanism for go-micro.
-	Implementation here https://godoc.org/github.com/micro/go-micro/transport/http
-	We add a link here for completeness
-*/
+func init() {
+	cmd.DefaultTransports["http"] = NewTransport
+}
 
+// NewTransport returns a new http transport using net/http and supporting http2
 func NewTransport(opts ...transport.Option) transport.Transport {
-	return http.NewTransport(opts...)
+	return transport.NewTransport(opts...)
 }

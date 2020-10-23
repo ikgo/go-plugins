@@ -8,9 +8,9 @@ import (
 	"os"
 	"path"
 
-	"github.com/micro/go-log"
-	"github.com/micro/go-plugins/registry/kubernetes/client/api"
-	"github.com/micro/go-plugins/registry/kubernetes/client/watch"
+	log "github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-plugins/registry/kubernetes/v2/client/api"
+	"github.com/micro/go-plugins/registry/kubernetes/v2/client/watch"
 )
 
 var (
@@ -64,7 +64,9 @@ func detectNamespace() (string, error) {
 // NewClientByHost sets up a client by host
 func NewClientByHost(host string) Kubernetes {
 	tr := &http.Transport{
-		TLSClientConfig:    &tls.Config{},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
 		DisableCompression: true,
 	}
 

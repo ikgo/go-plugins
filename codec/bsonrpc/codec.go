@@ -4,11 +4,7 @@ import (
 	"io"
 
 	"github.com/asim/go-bson"
-	"github.com/micro/go-micro/codec"
-)
-
-const (
-	bufferSize = 4096
+	"github.com/micro/go-micro/v2/codec"
 )
 
 type clientCodec struct {
@@ -21,18 +17,18 @@ type serverCodec struct {
 
 type request struct {
 	ServiceMethod string
-	Seq           uint64
+	Seq           string
 }
 
 type response struct {
 	ServiceMethod string
-	Seq           uint64
+	Seq           string
 	Error         string
 }
 
 func (c *clientCodec) Write(m *codec.Message, body interface{}) error {
 	if err := bson.MarshalToStream(c.rwc, &request{
-		ServiceMethod: m.Method,
+		ServiceMethod: m.Endpoint,
 		Seq:           m.Id,
 	}); err != nil {
 		return err
@@ -49,7 +45,7 @@ func (c *clientCodec) ReadHeader(m *codec.Message) error {
 		return err
 	}
 	m.Id = r.Seq
-	m.Method = r.ServiceMethod
+	m.Endpoint = r.ServiceMethod
 	m.Error = r.Error
 	return nil
 }
@@ -71,7 +67,7 @@ func (s *serverCodec) ReadHeader(m *codec.Message) error {
 		return err
 	}
 	m.Id = r.Seq
-	m.Method = r.ServiceMethod
+	m.Endpoint = r.ServiceMethod
 	return nil
 }
 
@@ -84,7 +80,7 @@ func (s *serverCodec) ReadBody(body interface{}) error {
 
 func (s *serverCodec) Write(m *codec.Message, body interface{}) error {
 	if err := bson.MarshalToStream(s.rwc, &response{
-		ServiceMethod: m.Method,
+		ServiceMethod: m.Endpoint,
 		Seq:           m.Id,
 		Error:         m.Error,
 	}); err != nil {

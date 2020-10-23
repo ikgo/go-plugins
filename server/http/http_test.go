@@ -6,13 +6,12 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/registry/mock"
-	"github.com/micro/go-micro/server"
+	"github.com/micro/go-micro/v2/registry/memory"
+	"github.com/micro/go-micro/v2/server"
 )
 
 func TestHTTPServer(t *testing.T) {
-	reg := mock.NewRegistry()
+	reg := memory.NewRegistry()
 
 	// create server
 	srv := NewServer(server.Registry(reg))
@@ -36,11 +35,6 @@ func TestHTTPServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// register server
-	if err := srv.Register(); err != nil {
-		t.Fatal(err)
-	}
-
 	// lookup server
 	service, err := reg.GetService(server.DefaultName)
 	if err != nil {
@@ -56,7 +50,7 @@ func TestHTTPServer(t *testing.T) {
 	}
 
 	// make request
-	rsp, err := http.Get(fmt.Sprintf("http://%s:%d", service[0].Nodes[0].Address, service[0].Nodes[0].Port))
+	rsp, err := http.Get(fmt.Sprintf("http://%s", service[0].Nodes[0].Address))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,17 +63,6 @@ func TestHTTPServer(t *testing.T) {
 
 	if s := string(b); s != "hello world" {
 		t.Fatalf("Expected response %s, got %s", "hello world", s)
-	}
-
-	// deregister server
-	if err := srv.Deregister(); err != nil {
-		t.Fatal(err)
-	}
-
-	// try get service
-	service, err = reg.GetService(server.DefaultName)
-	if err == nil {
-		t.Fatalf("Expected %v got %+v", registry.ErrNotFound, service)
 	}
 
 	// stop server

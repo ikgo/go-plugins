@@ -1,18 +1,31 @@
 package grpc
 
 import (
-	"github.com/micro/go-micro/transport"
-	pb "github.com/micro/go-plugins/transport/grpc/proto"
+	"github.com/asim/go-micro/v3/transport"
+	pb "github.com/asim/go-plugins/transport/grpc/v3/proto"
 	"google.golang.org/grpc"
 )
 
 type grpcTransportClient struct {
 	conn   *grpc.ClientConn
 	stream pb.Transport_StreamClient
+
+	local  string
+	remote string
 }
 
 type grpcTransportSocket struct {
 	stream pb.Transport_StreamServer
+	local  string
+	remote string
+}
+
+func (g *grpcTransportClient) Local() string {
+	return g.local
+}
+
+func (g *grpcTransportClient) Remote() string {
+	return g.remote
 }
 
 func (g *grpcTransportClient) Recv(m *transport.Message) error {
@@ -43,6 +56,14 @@ func (g *grpcTransportClient) Send(m *transport.Message) error {
 
 func (g *grpcTransportClient) Close() error {
 	return g.conn.Close()
+}
+
+func (g *grpcTransportSocket) Local() string {
+	return g.local
+}
+
+func (g *grpcTransportSocket) Remote() string {
+	return g.remote
 }
 
 func (g *grpcTransportSocket) Recv(m *transport.Message) error {

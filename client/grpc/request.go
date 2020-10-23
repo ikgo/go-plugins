@@ -2,10 +2,10 @@ package grpc
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 
-	"github.com/micro/go-micro/client"
+	"github.com/asim/go-micro/v3/client"
+	"github.com/asim/go-micro/v3/codec"
 )
 
 type grpcRequest struct {
@@ -14,38 +14,39 @@ type grpcRequest struct {
 	contentType string
 	request     interface{}
 	opts        client.RequestOptions
+	codec       codec.Codec
 }
 
-func methodToGRPC(method string, request interface{}) string {
+// service Struct.Method /service.Struct/Method
+func methodToGRPC(service, method string) string {
 	// no method or already grpc method
 	if len(method) == 0 || method[0] == '/' {
 		return method
 	}
-	// can't operate on nil request
-	t := reflect.TypeOf(request)
-	if t == nil {
-		return method
-	}
-	// dereference
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	// get package name
-	pParts := strings.Split(t.PkgPath(), "/")
-	pkg := pParts[len(pParts)-1]
+
 	// assume method is Foo.Bar
 	mParts := strings.Split(method, ".")
 	if len(mParts) != 2 {
 		return method
 	}
+
+	if len(service) == 0 {
+		return fmt.Sprintf("/%s/%s", mParts[0], mParts[1])
+	}
+
 	// return /pkg.Foo/Bar
-	return fmt.Sprintf("/%s.%s/%s", pkg, mParts[0], mParts[1])
+	return fmt.Sprintf("/%s.%s/%s", service, mParts[0], mParts[1])
 }
 
 func newGRPCRequest(service, method string, request interface{}, contentType string, reqOpts ...client.RequestOption) client.Request {
 	var opts client.RequestOptions
 	for _, o := range reqOpts {
 		o(&opts)
+	}
+
+	// set the content-type specified
+	if len(opts.ContentType) > 0 {
+		contentType = opts.ContentType
 	}
 
 	return &grpcRequest{
@@ -69,7 +70,15 @@ func (g *grpcRequest) Method() string {
 	return g.method
 }
 
-func (g *grpcRequest) Request() interface{} {
+func (g *grpcRequest) Endpoint() string {
+	return g.method
+}
+
+func (g *grpcRequest) Codec() codec.Writer {
+	return g.codec
+}
+
+func (g *grpcRequest) Body() interface{} {
 	return g.request
 }
 

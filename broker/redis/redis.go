@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/broker/codec"
-	"github.com/micro/go-micro/broker/codec/json"
-	"github.com/micro/go-micro/cmd"
+	"github.com/gomodule/redigo/redis"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/codec"
+	"github.com/micro/go-micro/v2/codec/json"
+	"github.com/micro/go-micro/v2/cmd"
 )
 
 func init() {
@@ -22,6 +22,7 @@ func init() {
 type publication struct {
 	topic   string
 	message *broker.Message
+	err     error
 }
 
 // Topic returns the topic this publication applies to.
@@ -40,9 +41,13 @@ func (p *publication) Ack() error {
 	return nil
 }
 
+func (p *publication) Error() error {
+	return p.err
+}
+
 // subscriber proxies and handles Redis messages as broker publications.
 type subscriber struct {
-	codec  codec.Codec
+	codec  codec.Marshaler
 	conn   *redis.PubSubConn
 	topic  string
 	handle broker.Handler
@@ -72,7 +77,7 @@ func (s *subscriber) recv() {
 			}
 
 			// Handle error? Retry?
-			if err := s.handle(&p); err != nil {
+			if p.err = s.handle(&p); p.err != nil {
 				break
 			}
 
@@ -251,7 +256,7 @@ func NewBroker(opts ...broker.Option) broker.Broker {
 
 	// Initialize with empty broker options.
 	options := broker.Options{
-		Codec:   json.NewCodec(),
+		Codec:   json.Marshaler{},
 		Context: context.WithValue(context.Background(), optionsKey, bopts),
 	}
 

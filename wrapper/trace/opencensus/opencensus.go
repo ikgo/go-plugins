@@ -6,11 +6,10 @@ import (
 	"encoding/base64"
 	"fmt"
 
-	"github.com/micro/go-log"
-	"github.com/micro/go-micro/client"
-	"github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/server"
-
+	"github.com/micro/go-micro/v2/client"
+	log "github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/metadata"
+	"github.com/micro/go-micro/v2/server"
 	"go.opencensus.io/trace"
 	"go.opencensus.io/trace/propagation"
 )
@@ -27,15 +26,9 @@ type clientWrapper struct {
 }
 
 func injectTraceIntoCtx(ctx context.Context, span *trace.Span) context.Context {
-	md, ok := metadata.FromContext(ctx)
-	if !ok {
-		md = make(map[string]string)
-	}
-
 	spanCtx := propagation.Binary(span.SpanContext())
-	md[TracePropagationField] = base64.RawStdEncoding.EncodeToString(spanCtx)
-
-	return metadata.NewContext(ctx, md)
+	metadata.Set(ctx, TracePropagationField, base64.RawStdEncoding.EncodeToString(spanCtx))
+	return ctx
 }
 
 // Call implements client.Client.Call.
@@ -56,8 +49,8 @@ func (w *clientWrapper) Call(
 }
 
 // Publish implements client.Client.Publish.
-func (w *clientWrapper) Publish(ctx context.Context, p client.Publication, opts ...client.PublishOption) (err error) {
-	t := newPublicationTracker(p, ClientProfile)
+func (w *clientWrapper) Publish(ctx context.Context, p client.Message, opts ...client.PublishOption) (err error) {
+	t := newEventTracker(p, ClientProfile)
 	ctx = t.start(ctx, true)
 
 	defer func() { t.end(ctx, err) }()
@@ -77,25 +70,20 @@ func NewClientWrapper() client.Wrapper {
 }
 
 func getTraceFromCtx(ctx context.Context) *trace.SpanContext {
-	md, ok := metadata.FromContext(ctx)
-	if !ok {
-		md = make(map[string]string)
-	}
-
-	encodedTraceCtx, ok := md[TracePropagationField]
+	encodedTraceCtx, ok := metadata.Get(ctx, TracePropagationField)
 	if !ok {
 		return nil
 	}
 
 	traceCtxBytes, err := base64.RawStdEncoding.DecodeString(encodedTraceCtx)
 	if err != nil {
-		log.Logf("Could not decode trace context: %s", err.Error())
+		log.Errorf("Could not decode trace context: %s", err.Error())
 		return nil
 	}
 
 	spanCtx, ok := propagation.FromBinary(traceCtxBytes)
 	if !ok {
-		log.Log("Could not decode trace context from binary")
+		log.Errorf("Could not decode trace context from binary")
 		return nil
 	}
 
@@ -114,16 +102,15 @@ func NewHandlerWrapper() server.HandlerWrapper {
 
 			spanCtx := getTraceFromCtx(ctx)
 			if spanCtx != nil {
-				t.span = trace.NewSpanWithRemoteParent(
-					fmt.Sprintf("rpc/%s/%s/%s", ServerProfile.Role, req.Service(), req.Method()),
+				ctx, t.span = trace.StartSpanWithRemoteParent(
+					ctx,
+					fmt.Sprintf("rpc/%s/%s/%s", ServerProfile.Role, req.Service(), req.Endpoint()),
 					*spanCtx,
-					trace.StartOptions{},
 				)
-				ctx = trace.WithSpan(ctx, t.span)
 			} else {
 				ctx, t.span = trace.StartSpan(
 					ctx,
-					fmt.Sprintf("rpc/%s/%s/%s", ServerProfile.Role, req.Service(), req.Method()),
+					fmt.Sprintf("rpc/%s/%s/%s", ServerProfile.Role, req.Service(), req.Endpoint()),
 				)
 			}
 
@@ -137,20 +124,19 @@ func NewHandlerWrapper() server.HandlerWrapper {
 // that adds tracing to subscription requests.
 func NewSubscriberWrapper() server.SubscriberWrapper {
 	return func(fn server.SubscriberFunc) server.SubscriberFunc {
-		return func(ctx context.Context, p server.Publication) (err error) {
-			t := newPublicationTracker(p, ServerProfile)
+		return func(ctx context.Context, p server.Message) (err error) {
+			t := newEventTracker(p, ServerProfile)
 			ctx = t.start(ctx, false)
 
 			defer func() { t.end(ctx, err) }()
 
 			spanCtx := getTraceFromCtx(ctx)
 			if spanCtx != nil {
-				t.span = trace.NewSpanWithRemoteParent(
+				ctx, t.span = trace.StartSpanWithRemoteParent(
+					ctx,
 					fmt.Sprintf("rpc/%s/pubsub/%s", ServerProfile.Role, p.Topic()),
 					*spanCtx,
-					trace.StartOptions{},
 				)
-				ctx = trace.WithSpan(ctx, t.span)
 			} else {
 				ctx, t.span = trace.StartSpan(
 					ctx,

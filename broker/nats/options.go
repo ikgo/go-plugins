@@ -1,20 +1,19 @@
 package nats
 
 import (
-	"context"
-
-	"github.com/micro/go-micro/broker"
-	"github.com/nats-io/nats"
+	"github.com/asim/go-micro/v3/broker"
+	nats "github.com/nats-io/nats.go"
 )
 
 type optionsKey struct{}
+type drainConnectionKey struct{}
 
 // Options accepts nats.Options
 func Options(opts nats.Options) broker.Option {
-	return func(o *broker.Options) {
-		if o.Context == nil {
-			o.Context = context.Background()
-		}
-		o.Context = context.WithValue(o.Context, optionsKey{}, opts)
-	}
+	return setBrokerOption(optionsKey{}, opts)
+}
+
+// DrainConnection will drain subscription on close
+func DrainConnection() broker.Option {
+	return setBrokerOption(drainConnectionKey{}, struct{}{})
 }

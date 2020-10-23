@@ -3,13 +3,17 @@ package googlepubsub
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"cloud.google.com/go/pubsub"
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/cmd"
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/cmd"
+	log "github.com/micro/go-micro/v2/logger"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type pubsubBroker struct {
@@ -30,6 +34,7 @@ type publication struct {
 	pm    *pubsub.Message
 	m     *broker.Message
 	topic string
+	err   error
 }
 
 func init() {
@@ -69,7 +74,8 @@ func (s *subscriber) run(hdlr broker.Handler) {
 				}
 
 				// If the error is nil lets check if we should auto ack
-				if err := hdlr(p); err == nil {
+				p.err = hdlr(p)
+				if p.err == nil {
 					// auto ack?
 					if s.options.AutoAck {
 						p.Ack()
@@ -97,13 +103,20 @@ func (s *subscriber) Unsubscribe() error {
 		return nil
 	default:
 		close(s.exit)
-		return s.sub.Delete(context.Background())
+		if deleteSubscription, ok := s.options.Context.Value(deleteSubscription{}).(bool); !ok || deleteSubscription {
+			return s.sub.Delete(context.Background())
+		}
+		return nil
 	}
 }
 
 func (p *publication) Ack() error {
 	p.pm.Ack()
 	return nil
+}
+
+func (p *publication) Error() error {
+	return p.err
 }
 
 func (p *publication) Topic() string {
@@ -136,39 +149,35 @@ func (b *pubsubBroker) Options() broker.Options {
 }
 
 // Publish checks if the topic exists and then publishes via google pubsub
-func (b *pubsubBroker) Publish(topic string, msg *broker.Message, opts ...broker.PublishOption) error {
+func (b *pubsubBroker) Publish(topic string, msg *broker.Message, opts ...broker.PublishOption) (err error) {
 	t := b.client.Topic(topic)
 	ctx := context.Background()
 
-	exists, err := t.Exists(ctx)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		tt, err := b.client.CreateTopic(ctx, topic)
-		if err != nil {
-			return err
-		}
-		t = tt
-	}
-
 	m := &pubsub.Message{
-		ID:         "m-" + uuid.NewUUID().String(),
+		ID:         "m-" + uuid.New().String(),
 		Data:       msg.Body,
 		Attributes: msg.Header,
 	}
 
 	pr := t.Publish(ctx, m)
-	_, err = pr.Get(ctx)
-	return err
+	if _, err = pr.Get(ctx); err != nil {
+		// create Topic if not exists
+		if status.Code(err) == codes.NotFound {
+			log.Infof("Topic not exists. creating Topic: %s", topic)
+			if t, err = b.client.CreateTopic(ctx, topic); err == nil {
+				_, err = t.Publish(ctx, m).Get(ctx)
+			}
+		}
+	}
+	return
 }
 
 // Subscribe registers a subscription to the given topic against the google pubsub api
 func (b *pubsubBroker) Subscribe(topic string, h broker.Handler, opts ...broker.SubscribeOption) (broker.Subscriber, error) {
 	options := broker.SubscribeOptions{
 		AutoAck: true,
-		Queue:   "q-" + uuid.NewUUID().String(),
+		Queue:   "q-" + uuid.New().String(),
+		Context: b.options.Context,
 	}
 
 	for _, o := range opts {
@@ -177,21 +186,24 @@ func (b *pubsubBroker) Subscribe(topic string, h broker.Handler, opts ...broker.
 
 	ctx := context.Background()
 	sub := b.client.Subscription(options.Queue)
-	exists, err := sub.Exists(ctx)
-	if err != nil {
-		return nil, err
-	}
 
-	if !exists {
-		tt := b.client.Topic(topic)
-		subb, err := b.client.CreateSubscription(ctx, options.Queue, pubsub.SubscriptionConfig{
-			Topic:       tt,
-			AckDeadline: time.Duration(0),
-		})
+	if createSubscription, ok := b.options.Context.Value(createSubscription{}).(bool); !ok || createSubscription {
+		exists, err := sub.Exists(ctx)
 		if err != nil {
 			return nil, err
 		}
-		sub = subb
+
+		if !exists {
+			tt := b.client.Topic(topic)
+			subb, err := b.client.CreateSubscription(ctx, options.Queue, pubsub.SubscriptionConfig{
+				Topic:       tt,
+				AckDeadline: time.Duration(0),
+			})
+			if err != nil {
+				return nil, err
+			}
+			sub = subb
+		}
 	}
 
 	subscriber := &subscriber{
@@ -222,6 +234,12 @@ func NewBroker(opts ...broker.Option) broker.Broker {
 
 	// retrieve project id
 	prjID, _ := options.Context.Value(projectIDKey{}).(string)
+
+	// if `GOOGLEPUBSUB_PROJECT_ID` is present, it will overwrite programmatically set projectID
+	if envPrjID := os.Getenv("GOOGLEPUBSUB_PROJECT_ID"); len(envPrjID) > 0 {
+		prjID = envPrjID
+	}
+
 	// retrieve client opts
 	cOpts, _ := options.Context.Value(clientOptionKey{}).([]option.ClientOption)
 

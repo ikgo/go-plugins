@@ -1,16 +1,18 @@
 package grpc
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"reflect"
+	"runtime/debug"
+	"strings"
 
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/server"
+	"github.com/asim/go-micro/v3/broker"
+	"github.com/asim/go-micro/v3/errors"
+	"github.com/asim/go-micro/v3/logger"
+	"github.com/asim/go-micro/v3/metadata"
+	"github.com/asim/go-micro/v3/registry"
+	"github.com/asim/go-micro/v3/server"
 )
 
 const (
@@ -34,7 +36,10 @@ type subscriber struct {
 }
 
 func newSubscriber(topic string, sub interface{}, opts ...server.SubscriberOption) server.Subscriber {
-	var options server.SubscriberOptions
+	options := server.SubscriberOptions{
+		AutoAck: true,
+	}
+
 	for _, o := range opts {
 		o(&options)
 	}
@@ -162,20 +167,41 @@ func validateSubscriber(sub server.Subscriber) error {
 }
 
 func (g *grpcServer) createSubHandler(sb *subscriber, opts server.Options) broker.Handler {
-	return func(p broker.Publication) error {
-		msg := p.Message()
+	return func(msg *broker.Message) (err error) {
+
+		defer func() {
+			if r := recover(); r != nil {
+				if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+					logger.Error("panic recovered: ", r)
+					logger.Error(string(debug.Stack()))
+				}
+				err = errors.InternalServerError(g.opts.Name+".subscriber", "panic recovered: %v", r)
+			}
+		}()
+
+		// if we don't have headers, create empty map
+		if msg.Header == nil {
+			msg.Header = make(map[string]string)
+		}
+
 		ct := msg.Header["Content-Type"]
-		cf, err := g.newCodec(ct)
+		if len(ct) == 0 {
+			msg.Header["Content-Type"] = defaultContentType
+			ct = defaultContentType
+		}
+		cf, err := g.newGRPCCodec(ct)
 		if err != nil {
 			return err
 		}
 
-		hdr := make(map[string]string)
+		hdr := make(map[string]string, len(msg.Header))
 		for k, v := range msg.Header {
 			hdr[k] = v
 		}
 		delete(hdr, "Content-Type")
 		ctx := metadata.NewContext(context.Background(), hdr)
+
+		results := make(chan error, len(sb.handlers))
 
 		for i := 0; i < len(sb.handlers); i++ {
 			handler := sb.handlers[i]
@@ -193,19 +219,11 @@ func (g *grpcServer) createSubHandler(sb *subscriber, opts server.Options) broke
 				req = req.Elem()
 			}
 
-			b := &buffer{bytes.NewBuffer(msg.Body)}
-			co := cf(b)
-			defer co.Close()
-
-			if err := co.ReadHeader(&codec.Message{}, codec.Publication); err != nil {
+			if err = cf.Unmarshal(msg.Body, req.Interface()); err != nil {
 				return err
 			}
 
-			if err := co.ReadBody(req.Interface()); err != nil {
-				return err
-			}
-
-			fn := func(ctx context.Context, msg server.Publication) error {
+			fn := func(ctx context.Context, msg server.Message) error {
 				var vals []reflect.Value
 				if sb.typ.Kind() != reflect.Func {
 					vals = append(vals, sb.rcvr)
@@ -214,11 +232,11 @@ func (g *grpcServer) createSubHandler(sb *subscriber, opts server.Options) broke
 					vals = append(vals, reflect.ValueOf(ctx))
 				}
 
-				vals = append(vals, reflect.ValueOf(msg.Message()))
+				vals = append(vals, reflect.ValueOf(msg.Payload()))
 
 				returnValues := handler.method.Call(vals)
-				if err := returnValues[0].Interface(); err != nil {
-					return err.(error)
+				if rerr := returnValues[0].Interface(); rerr != nil {
+					return rerr.(error)
 				}
 				return nil
 			}
@@ -227,17 +245,34 @@ func (g *grpcServer) createSubHandler(sb *subscriber, opts server.Options) broke
 				fn = opts.SubWrappers[i-1](fn)
 			}
 
-			g.wg.Add(1)
+			if g.wg != nil {
+				g.wg.Add(1)
+			}
 			go func() {
-				defer g.wg.Done()
-				fn(ctx, &rpcPublication{
+				if g.wg != nil {
+					defer g.wg.Done()
+				}
+				err := fn(ctx, &rpcMessage{
 					topic:       sb.topic,
 					contentType: ct,
-					message:     req.Interface(),
+					payload:     req.Interface(),
+					header:      msg.Header,
+					body:        msg.Body,
 				})
+				results <- err
 			}()
 		}
-		return nil
+		var errors []string
+		for i := 0; i < len(sb.handlers); i++ {
+			if rerr := <-results; rerr != nil {
+				errors = append(errors, rerr.Error())
+			}
+		}
+		if len(errors) > 0 {
+			err = fmt.Errorf("subscriber error: %s", strings.Join(errors, "\n"))
+		}
+
+		return err
 	}
 }
 

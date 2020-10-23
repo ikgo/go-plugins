@@ -2,39 +2,44 @@
 package kafka
 
 import (
+	"context"
+	"errors"
 	"sync"
 
 	"github.com/Shopify/sarama"
-	"github.com/micro/go-log"
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/broker/codec/json"
-	"github.com/micro/go-micro/cmd"
-	"github.com/pborman/uuid"
-	sc "gopkg.in/bsm/sarama-cluster.v2"
+	"github.com/google/uuid"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/codec/json"
+	"github.com/micro/go-micro/v2/cmd"
+	log "github.com/micro/go-micro/v2/logger"
 )
 
 type kBroker struct {
 	addrs []string
 
-	c  sarama.Client
-	p  sarama.SyncProducer
-	sc []*sc.Client
+	c sarama.Client
+	p sarama.SyncProducer
 
-	scMutex sync.Mutex
-	opts    broker.Options
+	sc []sarama.Client
+
+	connected bool
+	scMutex   sync.RWMutex
+	opts      broker.Options
 }
 
 type subscriber struct {
-	s    *sc.Consumer
+	cg   sarama.ConsumerGroup
 	t    string
 	opts broker.SubscribeOptions
 }
 
 type publication struct {
-	t  string
-	c  *sc.Consumer
-	km *sarama.ConsumerMessage
-	m  *broker.Message
+	t    string
+	err  error
+	cg   sarama.ConsumerGroup
+	km   *sarama.ConsumerMessage
+	m    *broker.Message
+	sess sarama.ConsumerGroupSession
 }
 
 func init() {
@@ -50,8 +55,12 @@ func (p *publication) Message() *broker.Message {
 }
 
 func (p *publication) Ack() error {
-	p.c.MarkOffset(p.km, "")
+	p.sess.MarkMessage(p.km, "")
 	return nil
+}
+
+func (p *publication) Error() error {
+	return p.err
 }
 
 func (s *subscriber) Options() broker.SubscribeOptions {
@@ -63,7 +72,7 @@ func (s *subscriber) Topic() string {
 }
 
 func (s *subscriber) Unsubscribe() error {
-	return s.s.Close()
+	return s.cg.Close()
 }
 
 func (k *kBroker) Address() string {
@@ -74,11 +83,19 @@ func (k *kBroker) Address() string {
 }
 
 func (k *kBroker) Connect() error {
-	if k.c != nil {
+	if k.isConnected() {
 		return nil
 	}
 
-	pconfig := sarama.NewConfig()
+	k.scMutex.Lock()
+	if k.c != nil {
+		k.connected = true
+		k.scMutex.Unlock()
+		return nil
+	}
+	k.scMutex.Unlock()
+
+	pconfig := k.getBrokerConfig()
 	// For implementation reasons, the SyncProducer requires
 	// `Producer.Return.Errors` and `Producer.Return.Successes`
 	// to be set to true in its configuration.
@@ -90,22 +107,25 @@ func (k *kBroker) Connect() error {
 		return err
 	}
 
-	k.c = c
-
 	p, err := sarama.NewSyncProducerFromClient(c)
 	if err != nil {
 		return err
 	}
 
-	k.p = p
 	k.scMutex.Lock()
-	defer k.scMutex.Unlock()
-	k.sc = make([]*sc.Client, 0)
+	k.c = c
+	k.p = p
+	k.sc = make([]sarama.Client, 0)
+	k.connected = true
+	k.scMutex.Unlock()
 
 	return nil
 }
 
 func (k *kBroker) Disconnect() error {
+	if !k.isConnected() {
+		return nil
+	}
 	k.scMutex.Lock()
 	defer k.scMutex.Unlock()
 	for _, client := range k.sc {
@@ -113,14 +133,35 @@ func (k *kBroker) Disconnect() error {
 	}
 	k.sc = nil
 	k.p.Close()
-	return k.c.Close()
+	if err := k.c.Close(); err != nil {
+		return err
+	}
+	k.connected = false
+	return nil
 }
 
 func (k *kBroker) Init(opts ...broker.Option) error {
 	for _, o := range opts {
 		o(&k.opts)
 	}
+	var cAddrs []string
+	for _, addr := range k.opts.Addrs {
+		if len(addr) == 0 {
+			continue
+		}
+		cAddrs = append(cAddrs, addr)
+	}
+	if len(cAddrs) == 0 {
+		cAddrs = []string{"127.0.0.1:9092"}
+	}
+	k.addrs = cAddrs
 	return nil
+}
+
+func (k *kBroker) isConnected() bool {
+	k.scMutex.RLock()
+	defer k.scMutex.RUnlock()
+	return k.connected
 }
 
 func (k *kBroker) Options() broker.Options {
@@ -128,28 +169,29 @@ func (k *kBroker) Options() broker.Options {
 }
 
 func (k *kBroker) Publish(topic string, msg *broker.Message, opts ...broker.PublishOption) error {
+	if !k.isConnected() {
+		return errors.New("[kafka] broker not connected")
+	}
+
 	b, err := k.opts.Codec.Marshal(msg)
 	if err != nil {
 		return err
 	}
+
 	_, _, err = k.p.SendMessage(&sarama.ProducerMessage{
 		Topic: topic,
 		Value: sarama.ByteEncoder(b),
 	})
+
 	return err
 }
 
-func (k *kBroker) getSaramaClusterClient(topic string) (*sc.Client, error) {
-	config := sc.NewConfig()
-
-	// TODO: make configurable offset as SubscriberOption
-	config.Config.Consumer.Offsets.Initial = sarama.OffsetNewest
-
-	cs, err := sc.NewClient(k.addrs, config)
+func (k *kBroker) getSaramaClusterClient(topic string) (sarama.Client, error) {
+	config := k.getClusterConfig()
+	cs, err := sarama.NewClient(k.addrs, config)
 	if err != nil {
 		return nil, err
 	}
-
 	k.scMutex.Lock()
 	defer k.scMutex.Unlock()
 	k.sc = append(k.sc, cs)
@@ -159,51 +201,49 @@ func (k *kBroker) getSaramaClusterClient(topic string) (*sc.Client, error) {
 func (k *kBroker) Subscribe(topic string, handler broker.Handler, opts ...broker.SubscribeOption) (broker.Subscriber, error) {
 	opt := broker.SubscribeOptions{
 		AutoAck: true,
-		Queue:   uuid.NewUUID().String(),
+		Queue:   uuid.New().String(),
 	}
-
 	for _, o := range opts {
 		o(&opt)
 	}
-
 	// we need to create a new client per consumer
-	cs, err := k.getSaramaClusterClient(topic)
+	c, err := k.getSaramaClusterClient(topic)
 	if err != nil {
 		return nil, err
 	}
-
-	c, err := sc.NewConsumerFromClient(cs, opt.Queue, []string{topic})
+	cg, err := sarama.NewConsumerGroupFromClient(opt.Queue, c)
 	if err != nil {
 		return nil, err
 	}
-
+	h := &consumerGroupHandler{
+		handler: handler,
+		subopts: opt,
+		kopts:   k.opts,
+		cg:      cg,
+	}
+	ctx := context.Background()
+	topics := []string{topic}
 	go func() {
 		for {
 			select {
-			case err := <-c.Errors():
-				log.Log("consumer error:", err)
-			case sm := <-c.Messages():
-				// ensure message is not nil
-				if sm == nil {
-					continue
+			case err := <-cg.Errors():
+				if err != nil {
+					log.Errorf("consumer error:", err)
 				}
-				var m broker.Message
-				if err := k.opts.Codec.Unmarshal(sm.Value, &m); err != nil {
+			default:
+				err := cg.Consume(ctx, topics, h)
+				switch err {
+				case sarama.ErrClosedConsumerGroup:
+					return
+				case nil:
 					continue
-				}
-				if err := handler(&publication{
-					m:  &m,
-					t:  sm.Topic,
-					c:  c,
-					km: sm,
-				}); err == nil && opt.AutoAck {
-					c.MarkOffset(sm, "")
+				default:
+					log.Error(err)
 				}
 			}
 		}
 	}()
-
-	return &subscriber{s: c, opts: opt}, nil
+	return &subscriber{cg: cg, opts: opt, t: topic}, nil
 }
 
 func (k *kBroker) String() string {
@@ -213,7 +253,8 @@ func (k *kBroker) String() string {
 func NewBroker(opts ...broker.Option) broker.Broker {
 	options := broker.Options{
 		// default to json codec
-		Codec: json.NewCodec(),
+		Codec:   json.Marshaler{},
+		Context: context.Background(),
 	}
 
 	for _, o := range opts {
@@ -235,4 +276,25 @@ func NewBroker(opts ...broker.Option) broker.Broker {
 		addrs: cAddrs,
 		opts:  options,
 	}
+}
+
+func (k *kBroker) getBrokerConfig() *sarama.Config {
+	if c, ok := k.opts.Context.Value(brokerConfigKey{}).(*sarama.Config); ok {
+		return c
+	}
+	return DefaultBrokerConfig
+}
+
+func (k *kBroker) getClusterConfig() *sarama.Config {
+	if c, ok := k.opts.Context.Value(clusterConfigKey{}).(*sarama.Config); ok {
+		return c
+	}
+	clusterConfig := DefaultClusterConfig
+	// the oldest supported version is V0_10_2_0
+	if !clusterConfig.Version.IsAtLeast(sarama.V0_10_2_0) {
+		clusterConfig.Version = sarama.V0_10_2_0
+	}
+	clusterConfig.Consumer.Return.Errors = true
+	clusterConfig.Consumer.Offsets.Initial = sarama.OffsetNewest
+	return clusterConfig
 }

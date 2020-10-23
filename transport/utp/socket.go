@@ -4,8 +4,16 @@ import (
 	"errors"
 	"time"
 
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/transport"
 )
+
+func (u *utpSocket) Local() string {
+	return u.conn.LocalAddr().String()
+}
+
+func (u *utpSocket) Remote() string {
+	return u.conn.RemoteAddr().String()
+}
 
 func (u *utpSocket) Recv(m *transport.Message) error {
 	if m == nil {

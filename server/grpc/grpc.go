@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"reflect"
 	"runtime/debug"
@@ -15,51 +14,68 @@ import (
 	"sync"
 	"time"
 
-	"github.com/micro/go-log"
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/cmd"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/errors"
-	meta "github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/server"
-	"github.com/micro/util/go/lib/addr"
-	mgrpc "github.com/micro/util/go/lib/grpc"
+	"github.com/asim/go-micro/v3/broker"
+	"github.com/asim/go-micro/v3/errors"
+	pberr "github.com/asim/go-micro/v3/errors/proto"
+	"github.com/asim/go-micro/v3/logger"
+	meta "github.com/asim/go-micro/v3/metadata"
+	"github.com/asim/go-micro/v3/registry"
+	"github.com/asim/go-micro/v3/server"
+	"github.com/asim/go-micro/v3/util/addr"
+	"github.com/asim/go-micro/v3/util/backoff"
+	mnet "github.com/asim/go-micro/v3/util/net"
+	"github.com/golang/protobuf/proto"
+	"golang.org/x/net/netutil"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/transport"
+)
+
+var (
+	// DefaultMaxMsgSize define maximum message size that server can send
+	// or receive.  Default value is 4MB.
+	DefaultMaxMsgSize = 1024 * 1024 * 4
 )
 
 const (
-	defaultMaxMsgSize  = 1024 * 1024 * 4 // use 4MB as the default message size limit
 	defaultContentType = "application/grpc"
 )
 
 type grpcServer struct {
 	rpc  *rServer
+	srv  *grpc.Server
 	exit chan chan error
-	wg   sync.WaitGroup
+	wg   *sync.WaitGroup
 
 	sync.RWMutex
 	opts        server.Options
 	handlers    map[string]server.Handler
 	subscribers map[*subscriber][]broker.Subscriber
+	// marks the serve as started
+	started bool
 	// used for first registration
 	registered bool
+
+	// registry service instance
+	rsvc *registry.Service
 }
 
 func init() {
-	cmd.DefaultServers["grpc"] = NewServer
+	encoding.RegisterCodec(wrapCodec{jsonCodec{}})
+	encoding.RegisterCodec(wrapCodec{protoCodec{}})
+	encoding.RegisterCodec(wrapCodec{bytesCodec{}})
 }
 
 func newGRPCServer(opts ...server.Option) server.Server {
 	options := newOptions(opts...)
 
-	return &grpcServer{
+	// create a grpc server
+	srv := &grpcServer{
 		opts: options,
 		rpc: &rServer{
 			serviceMap: make(map[string]*service),
@@ -67,133 +83,136 @@ func newGRPCServer(opts ...server.Option) server.Server {
 		handlers:    make(map[string]server.Handler),
 		subscribers: make(map[*subscriber][]broker.Subscriber),
 		exit:        make(chan chan error),
+		wg:          wait(options.Context),
 	}
+
+	// configure the grpc server
+	srv.configure()
+
+	return srv
+}
+
+type grpcRouter struct {
+	h func(context.Context, server.Request, interface{}) error
+	m func(context.Context, server.Message) error
+}
+
+func (r grpcRouter) ProcessMessage(ctx context.Context, msg server.Message) error {
+	return r.m(ctx, msg)
+}
+
+func (r grpcRouter) ServeRequest(ctx context.Context, req server.Request, rsp server.Response) error {
+	return r.h(ctx, req, rsp)
+}
+
+func (g *grpcServer) configure(opts ...server.Option) {
+	g.Lock()
+	defer g.Unlock()
+
+	// Don't reprocess where there's no config
+	if len(opts) == 0 && g.srv != nil {
+		return
+	}
+
+	for _, o := range opts {
+		o(&g.opts)
+	}
+
+	g.wg = wait(g.opts.Context)
+
+	maxMsgSize := g.getMaxMsgSize()
+
+	gopts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(maxMsgSize),
+		grpc.MaxSendMsgSize(maxMsgSize),
+		grpc.UnknownServiceHandler(g.handler),
+	}
+
+	if creds := g.getCredentials(); creds != nil {
+		gopts = append(gopts, grpc.Creds(creds))
+	}
+
+	if opts := g.getGrpcOptions(); opts != nil {
+		gopts = append(gopts, opts...)
+	}
+
+	g.rsvc = nil
+	g.srv = grpc.NewServer(gopts...)
+}
+
+func (g *grpcServer) getMaxMsgSize() int {
+	if g.opts.Context == nil {
+		return DefaultMaxMsgSize
+	}
+	s, ok := g.opts.Context.Value(maxMsgSizeKey{}).(int)
+	if !ok {
+		return DefaultMaxMsgSize
+	}
+	return s
 }
 
 func (g *grpcServer) getCredentials() credentials.TransportCredentials {
 	if g.opts.Context != nil {
-		if v := g.opts.Context.Value(tlsAuth{}); v != nil {
-			tls := v.(*tls.Config)
-			return credentials.NewTLS(tls)
+		if v, ok := g.opts.Context.Value(tlsAuth{}).(*tls.Config); ok && v != nil {
+			return credentials.NewTLS(v)
 		}
 	}
 	return nil
 }
 
-func (g *grpcServer) getHttp2TransportConfig() transport.ServerConfig {
-	if g.opts.Context != nil {
-		if v := g.opts.Context.Value(transportConfig{}); v != nil {
-			return *v.(*transport.ServerConfig)
-		}
+func (g *grpcServer) getGrpcOptions() []grpc.ServerOption {
+	if g.opts.Context == nil {
+		return nil
 	}
-	return transport.ServerConfig{}
+
+	opts, ok := g.opts.Context.Value(grpcOptions{}).([]grpc.ServerOption)
+	if !ok || opts == nil {
+		return nil
+	}
+
+	return opts
 }
 
-func (g *grpcServer) serve(l net.Listener) error {
-	defer l.Close()
+func (g *grpcServer) getListener() net.Listener {
+	if g.opts.Context == nil {
+		return nil
+	}
 
-	var tempDelay time.Duration
+	if l, ok := g.opts.Context.Value(netListener{}).(net.Listener); ok && l != nil {
+		return l
+	}
 
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			if ne, ok := err.(interface {
-				Temporary() bool
-			}); ok && ne.Temporary() {
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay *= 2
-				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
-				}
-				select {
-				case <-time.After(tempDelay):
-				}
-				continue
+	return nil
+}
+
+func (g *grpcServer) handler(srv interface{}, stream grpc.ServerStream) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				logger.Error("panic recovered: ", r)
+				logger.Error(string(debug.Stack()))
 			}
-			return err
+			err = errors.InternalServerError(g.opts.Name, "panic recovered: %v", r)
+		} else if err != nil {
+			if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+				logger.Errorf("grpc handler got error: %s", err)
+			}
 		}
-		tempDelay = 0
+	}()
 
-		go g.accept(conn)
-	}
-}
-
-func (g *grpcServer) useTransportAuthenticator(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
-	if creds := g.getCredentials(); creds != nil {
-		return creds.ServerHandshake(rawConn)
-	}
-	return rawConn, nil, nil
-}
-
-func (g *grpcServer) accept(rawConn net.Conn) {
-	conn, authInfo, err := g.useTransportAuthenticator(rawConn)
-
-	if err != nil {
-		rawConn.Close()
-		return
-	}
-
-	serverConfig := g.getHttp2TransportConfig()
-	serverConfig.AuthInfo = authInfo
-
-	st, err := transport.NewServerTransport("http2", conn, &serverConfig)
-	if err != nil {
-		conn.Close()
-		return
-	}
-	defer st.Close()
-
-	var wg sync.WaitGroup
-	st.HandleStreams(func(stream *transport.Stream) {
-		wg.Add(1)
+	if g.wg != nil {
 		g.wg.Add(1)
-		go func() {
-			defer func() {
-				wg.Done()
-				g.wg.Done()
+		defer g.wg.Done()
+	}
 
-				if r := recover(); r != nil {
-					log.Log(r, string(debug.Stack()))
-				}
-			}()
+	fullMethod, ok := grpc.MethodFromServerStream(stream)
+	if !ok {
+		return status.Errorf(codes.Internal, "method does not exist in context")
+	}
 
-			g.serveStream(st, stream)
-		}()
-	}, func(ctx context.Context, method string) context.Context {
-		return ctx
-	})
-	wg.Wait()
-}
-
-func (g *grpcServer) serveStream(t transport.ServerTransport, stream *transport.Stream) {
-	// get Go method from stream method
-	serviceName, methodName, err := mgrpc.ServiceMethod(stream.Method())
+	serviceName, methodName, err := ServiceMethod(fullMethod)
 	if err != nil {
-		if gerr := t.WriteStatus(stream, status.New(codes.InvalidArgument, err.Error())); err != nil {
-			log.Logf("grpc: Server.serveStream failed to write status: %v", gerr)
-		}
-		return
-	}
-
-	g.rpc.mu.Lock()
-	service := g.rpc.serviceMap[serviceName]
-	g.rpc.mu.Unlock()
-	if service == nil {
-		if err := t.WriteStatus(stream, status.New(codes.Unimplemented, fmt.Sprintf("unknown service %v", service))); err != nil {
-			log.Logf("grpc: Server.serveStream failed to write status: %v", err)
-		}
-		return
-	}
-
-	mtype := service.method[methodName]
-	if mtype == nil {
-		if err := t.WriteStatus(stream, status.New(codes.Unimplemented, fmt.Sprintf("unknown service %v", service))); err != nil {
-			log.Logf("grpc: Server.serveStream failed to write status: %v", err)
-		}
-		return
+		return status.New(codes.InvalidArgument, err.Error()).Err()
 	}
 
 	// get grpc metadata
@@ -208,23 +227,18 @@ func (g *grpcServer) serveStream(t transport.ServerTransport, stream *transport.
 		md[k] = strings.Join(v, ", ")
 	}
 
+	// timeout for server deadline
+	to := md["timeout"]
+
 	// get content type
 	ct := defaultContentType
+
 	if ctype, ok := md["x-content-type"]; ok {
 		ct = ctype
 	}
-
-	// get codec
-	codec, err := g.newGRPCCodec(ct)
-	if err != nil {
-		if errr := t.WriteStatus(stream, status.New(codes.Internal, err.Error())); errr != nil {
-			log.Logf("grpc: Server.serveStream failed to write status: %v", errr)
-		}
-		return
+	if ctype, ok := md["content-type"]; ok {
+		ct = ctype
 	}
-
-	// timeout for server deadline
-	to := md["timeout"]
 
 	delete(md, "x-content-type")
 	delete(md, "timeout")
@@ -232,86 +246,97 @@ func (g *grpcServer) serveStream(t transport.ServerTransport, stream *transport.
 	// create new context
 	ctx := meta.NewContext(stream.Context(), md)
 
+	// get peer from context
+	if p, ok := peer.FromContext(stream.Context()); ok {
+		md["Remote"] = p.Addr.String()
+		ctx = peer.NewContext(ctx, p)
+	}
+
 	// set the timeout if we have it
 	if len(to) > 0 {
 		if n, err := strconv.ParseUint(to, 10, 64); err == nil {
-			ctx, _ = context.WithTimeout(ctx, time.Duration(n))
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(n))
+			defer cancel()
 		}
+	}
+
+	// process via router
+	if g.opts.Router != nil {
+		cc, err := g.newGRPCCodec(ct)
+		if err != nil {
+			return errors.InternalServerError(g.opts.Name, err.Error())
+		}
+		codec := &grpcCodec{
+			ServerStream: stream,
+			method:       fmt.Sprintf("%s.%s", serviceName, methodName),
+			endpoint:     fmt.Sprintf("%s.%s", serviceName, methodName),
+			target:       g.opts.Name,
+			c:            cc,
+		}
+
+		// create a client.Request
+		request := &rpcRequest{
+			service:     ServiceFromMethod(fullMethod),
+			contentType: ct,
+			method:      fmt.Sprintf("%s.%s", serviceName, methodName),
+			codec:       codec,
+			stream:      true,
+		}
+
+		response := &rpcResponse{
+			header: make(map[string]string),
+			codec:  codec,
+		}
+
+		// create a wrapped function
+		handler := func(ctx context.Context, req server.Request, rsp interface{}) error {
+			return g.opts.Router.ServeRequest(ctx, req, rsp.(server.Response))
+		}
+
+		// execute the wrapper for it
+		for i := len(g.opts.HdlrWrappers); i > 0; i-- {
+			handler = g.opts.HdlrWrappers[i-1](handler)
+		}
+
+		r := grpcRouter{h: handler}
+
+		// serve the actual request using the request router
+		if err := r.ServeRequest(ctx, request, response); err != nil {
+			if _, ok := status.FromError(err); ok {
+				return err
+			}
+			return status.Errorf(codes.Internal, err.Error())
+		}
+
+		return nil
+	}
+
+	// process the standard request flow
+	g.rpc.mu.Lock()
+	service := g.rpc.serviceMap[serviceName]
+	g.rpc.mu.Unlock()
+
+	if service == nil {
+		return status.New(codes.Unimplemented, fmt.Sprintf("unknown service %s", serviceName)).Err()
+	}
+
+	mtype := service.method[methodName]
+	if mtype == nil {
+		return status.New(codes.Unimplemented, fmt.Sprintf("unknown service %s.%s", serviceName, methodName)).Err()
 	}
 
 	// process unary
 	if !mtype.stream {
-		g.processRequest(t, stream, service, mtype, codec, ct, ctx)
-		return
+		return g.processRequest(stream, service, mtype, ct, ctx)
 	}
 
-	// process strea
-	g.processStream(t, stream, service, mtype, codec, ct, ctx)
+	// process stream
+	return g.processStream(stream, service, mtype, ct, ctx)
 }
 
-func (g *grpcServer) sendResponse(t transport.ServerTransport, stream *transport.Stream, msg interface{}, codec grpc.Codec, opts *transport.Options) error {
-	hd, p, err := encode(codec, msg, nil, nil, nil)
-	if err != nil {
-		log.Fatalf("grpc: Server failed to encode response %v", err)
-	}
-	return t.Write(stream, hd, p, opts)
-}
-
-func (g *grpcServer) processRequest(t transport.ServerTransport, stream *transport.Stream, service *service, mtype *methodType, codec grpc.Codec, ct string, ctx context.Context) (err error) {
-	p := &parser{r: stream}
+func (g *grpcServer) processRequest(stream grpc.ServerStream, service *service, mtype *methodType, ct string, ctx context.Context) error {
 	for {
-		pf, req, err := p.recvMsg(defaultMaxMsgSize)
-		if err == io.EOF {
-			// The entire stream is done (for unary RPC only).
-			return err
-		}
-		if err == io.ErrUnexpectedEOF {
-			err = Errorf(codes.Internal, io.ErrUnexpectedEOF.Error())
-		}
-		if err != nil {
-			switch err := err.(type) {
-			case *rpcError:
-				if err := t.WriteStatus(stream, status.New(err.code, err.desc)); err != nil {
-					log.Logf("grpc: Server.processUnaryRPC failed to write status %v", err)
-				}
-			case transport.ConnectionError:
-				// Nothing to do here.
-			case transport.StreamError:
-				if err := t.WriteStatus(stream, status.New(err.Code, err.Desc)); err != nil {
-					log.Logf("grpc: Server.processUnaryRPC failed to write status %v", err)
-				}
-			default:
-				panic(fmt.Sprintf("grpc: Unexpected error (%T) from recvMsg: %v", err, err))
-			}
-			return err
-		}
-
-		if err := checkRecvPayload(pf, stream.RecvCompress(), nil); err != nil {
-			switch err := err.(type) {
-			case *rpcError:
-				if err := t.WriteStatus(stream, status.New(err.code, err.desc)); err != nil {
-					log.Logf("grpc: Server.processUnaryRPC failed to write status %v", err)
-				}
-			default:
-				if err := t.WriteStatus(stream, status.New(codes.Internal, err.Error())); err != nil {
-					log.Logf("grpc: Server.processUnaryRPC failed to write status %v", err)
-				}
-
-			}
-			return err
-		}
-
-		// status code/desc
-		statusCode := codes.OK
-		statusDesc := ""
-
-		// exceeds max message size, bail early
-		if len(req) > defaultMaxMsgSize {
-			statusCode = codes.Internal
-			statusDesc = fmt.Sprintf("grpc: server received a message of %d bytes exceeding %d limit", len(req), defaultMaxMsgSize)
-			return t.WriteStatus(stream, status.New(statusCode, statusDesc))
-		}
-
 		var argv, replyv reflect.Value
 
 		// Decode the argument value.
@@ -324,14 +349,8 @@ func (g *grpcServer) processRequest(t transport.ServerTransport, stream *transpo
 		}
 
 		// Unmarshal request
-		if err := codec.Unmarshal(req, argv.Interface()); err != nil {
-			statusCode = convertCode(err)
-			statusDesc = err.Error()
-			if err := t.WriteStatus(stream, status.New(statusCode, statusDesc)); err != nil {
-				log.Logf("grpc: Server.processUnaryRPC failed to write status: %v", err)
-				return err
-			}
-			return nil
+		if err := stream.RecvMsg(argv.Interface()); err != nil {
+			return err
 		}
 
 		if argIsValue {
@@ -344,24 +363,34 @@ func (g *grpcServer) processRequest(t transport.ServerTransport, stream *transpo
 		function := mtype.method.Func
 		var returnValues []reflect.Value
 
+		cc, err := g.newGRPCCodec(ct)
+		if err != nil {
+			return errors.InternalServerError(g.opts.Name, err.Error())
+		}
+		b, err := cc.Marshal(argv.Interface())
+		if err != nil {
+			return err
+		}
+
 		// create a client.Request
 		r := &rpcRequest{
 			service:     g.opts.Name,
 			contentType: ct,
 			method:      fmt.Sprintf("%s.%s", service.name, mtype.method.Name),
-			request:     argv.Interface(),
+			body:        b,
+			payload:     argv.Interface(),
 		}
 
 		// define the handler func
-		fn := func(ctx context.Context, req server.Request, rsp interface{}) error {
-			returnValues = function.Call([]reflect.Value{service.rcvr, mtype.prepareContext(ctx), reflect.ValueOf(req.Request()), reflect.ValueOf(rsp)})
+		fn := func(ctx context.Context, req server.Request, rsp interface{}) (err error) {
+			returnValues = function.Call([]reflect.Value{service.rcvr, mtype.prepareContext(ctx), reflect.ValueOf(argv.Interface()), reflect.ValueOf(rsp)})
 
 			// The return value for the method is an error.
-			if err := returnValues[0].Interface(); err != nil {
-				return err.(error)
+			if rerr := returnValues[0].Interface(); rerr != nil {
+				err = rerr.(error)
 			}
 
-			return nil
+			return err
 		}
 
 		// wrap the handler func
@@ -369,46 +398,56 @@ func (g *grpcServer) processRequest(t transport.ServerTransport, stream *transpo
 			fn = g.opts.HdlrWrappers[i-1](fn)
 		}
 
+		statusCode := codes.OK
+		statusDesc := ""
+
 		// execute the handler
 		if appErr := fn(ctx, r, replyv.Interface()); appErr != nil {
-			if err, ok := appErr.(*rpcError); ok {
-				statusCode = err.code
-				statusDesc = err.desc
-			} else if err, ok := appErr.(*errors.Error); ok {
-				statusCode = microError(err)
-				statusDesc = appErr.Error()
-			} else {
+			var errStatus *status.Status
+			switch verr := appErr.(type) {
+			case *errors.Error:
+				perr := &pberr.Error{
+					Id:     verr.Id,
+					Code:   verr.Code,
+					Detail: verr.Detail,
+					Status: verr.Status,
+				}
+
+				// micro.Error now proto based and we can attach it to grpc status
+				statusCode = microError(verr)
+				statusDesc = verr.Error()
+
+				errStatus, err = status.New(statusCode, statusDesc).WithDetails(perr)
+				if err != nil {
+					return err
+				}
+			case proto.Message:
+				// user defined error that proto based we can attach it to grpc status
 				statusCode = convertCode(appErr)
 				statusDesc = appErr.Error()
-			}
-			if err := t.WriteStatus(stream, status.New(statusCode, statusDesc)); err != nil {
-				log.Logf("grpc: Server.processUnaryRPC failed to write status: %v", err)
-				return err
-			}
-			return nil
-		}
-		opts := &transport.Options{
-			Last:  true,
-			Delay: false,
-		}
-		if err := g.sendResponse(t, stream, replyv.Interface(), codec, opts); err != nil {
-			switch err := err.(type) {
-			case transport.ConnectionError:
-				// Nothing to do here.
-			case transport.StreamError:
-				statusCode = err.Code
-				statusDesc = err.Desc
+				errStatus, err = status.New(statusCode, statusDesc).WithDetails(verr)
+				if err != nil {
+					return err
+				}
 			default:
-				statusCode = codes.Unknown
-				statusDesc = err.Error()
+				// default case user pass own error type that not proto based
+				statusCode = convertCode(verr)
+				statusDesc = verr.Error()
+				errStatus = status.New(statusCode, statusDesc)
 			}
+
+			return errStatus.Err()
+		}
+
+		if err := stream.SendMsg(replyv.Interface()); err != nil {
 			return err
 		}
-		return t.WriteStatus(stream, status.New(statusCode, statusDesc))
+
+		return status.New(statusCode, statusDesc).Err()
 	}
 }
 
-func (g *grpcServer) processStream(t transport.ServerTransport, stream *transport.Stream, service *service, mtype *methodType, codec grpc.Codec, ct string, ctx context.Context) (err error) {
+func (g *grpcServer) processStream(stream grpc.ServerStream, service *service, mtype *methodType, ct string, ctx context.Context) error {
 	opts := g.opts
 
 	r := &rpcRequest{
@@ -419,12 +458,8 @@ func (g *grpcServer) processStream(t transport.ServerTransport, stream *transpor
 	}
 
 	ss := &rpcStream{
-		request:    r,
-		t:          t,
-		s:          stream,
-		p:          &parser{r: stream},
-		codec:      codec,
-		maxMsgSize: defaultMaxMsgSize,
+		ServerStream: stream,
+		request:      r,
 	}
 
 	function := mtype.method.Func
@@ -444,31 +479,53 @@ func (g *grpcServer) processStream(t transport.ServerTransport, stream *transpor
 		fn = opts.HdlrWrappers[i-1](fn)
 	}
 
-	appErr := fn(ctx, r, ss)
-	if appErr != nil {
-		if err, ok := appErr.(*rpcError); ok {
-			ss.statusCode = err.code
-			ss.statusDesc = err.desc
-		} else if err, ok := appErr.(*errors.Error); ok {
-			ss.statusCode = microError(err)
-			ss.statusDesc = appErr.Error()
-		} else if err, ok := appErr.(transport.StreamError); ok {
-			ss.statusCode = err.Code
-			ss.statusDesc = err.Desc
-		} else {
-			ss.statusCode = convertCode(appErr)
-			ss.statusDesc = appErr.Error()
+	statusCode := codes.OK
+	statusDesc := ""
+
+	if appErr := fn(ctx, r, ss); appErr != nil {
+		var err error
+		var errStatus *status.Status
+		switch verr := appErr.(type) {
+		case *errors.Error:
+			perr := &pberr.Error{
+				Id:     verr.Id,
+				Code:   verr.Code,
+				Detail: verr.Detail,
+				Status: verr.Status,
+			}
+			// micro.Error now proto based and we can attach it to grpc status
+			statusCode = microError(verr)
+			statusDesc = verr.Error()
+			errStatus, err = status.New(statusCode, statusDesc).WithDetails(perr)
+			if err != nil {
+				return err
+			}
+		case proto.Message:
+			// user defined error that proto based we can attach it to grpc status
+			statusCode = convertCode(appErr)
+			statusDesc = appErr.Error()
+			errStatus, err = status.New(statusCode, statusDesc).WithDetails(verr)
+			if err != nil {
+				return err
+			}
+		default:
+			// default case user pass own error type that not proto based
+			statusCode = convertCode(verr)
+			statusDesc = verr.Error()
+			errStatus = status.New(statusCode, statusDesc)
 		}
+
+		return errStatus.Err()
 	}
 
-	return t.WriteStatus(ss.s, status.New(ss.statusCode, ss.statusDesc))
+	return status.New(statusCode, statusDesc).Err()
 }
 
-func (g *grpcServer) newGRPCCodec(contentType string) (grpc.Codec, error) {
-	codecs := make(map[string]grpc.Codec)
+func (g *grpcServer) newGRPCCodec(contentType string) (encoding.Codec, error) {
+	codecs := make(map[string]encoding.Codec)
 	if g.opts.Context != nil {
-		if v := g.opts.Context.Value(codecsKey{}); v != nil {
-			codecs = v.(map[string]grpc.Codec)
+		if v, ok := g.opts.Context.Value(codecsKey{}).(map[string]encoding.Codec); ok && v != nil {
+			codecs = v
 		}
 	}
 	if c, ok := codecs[contentType]; ok {
@@ -480,25 +537,16 @@ func (g *grpcServer) newGRPCCodec(contentType string) (grpc.Codec, error) {
 	return nil, fmt.Errorf("Unsupported Content-Type: %s", contentType)
 }
 
-func (g *grpcServer) newCodec(contentType string) (codec.NewCodec, error) {
-	if cf, ok := g.opts.Codecs[contentType]; ok {
-		return cf, nil
-	}
-	if cf, ok := defaultRPCCodecs[contentType]; ok {
-		return cf, nil
-	}
-	return nil, fmt.Errorf("Unsupported Content-Type: %s", contentType)
-}
-
 func (g *grpcServer) Options() server.Options {
+	g.RLock()
 	opts := g.opts
+	g.RUnlock()
+
 	return opts
 }
 
 func (g *grpcServer) Init(opts ...server.Option) error {
-	for _, opt := range opts {
-		opt(&g.opts)
-	}
+	g.configure(opts...)
 	return nil
 }
 
@@ -533,21 +581,64 @@ func (g *grpcServer) Subscribe(sb server.Subscriber) error {
 	}
 
 	g.Lock()
-
-	_, ok = g.subscribers[sub]
-	if ok {
+	if _, ok = g.subscribers[sub]; ok {
+		g.Unlock()
 		return fmt.Errorf("subscriber %v already exists", sub)
 	}
+
 	g.subscribers[sub] = nil
 	g.Unlock()
 	return nil
 }
 
 func (g *grpcServer) Register() error {
-	// parse address for host, port
+	g.RLock()
+	rsvc := g.rsvc
 	config := g.opts
-	var advt, host string
-	var port int
+	g.RUnlock()
+
+	// only register if it exists or is not noop
+	if config.Registry == nil || config.Registry.String() == "noop" {
+		return nil
+	}
+
+	regFunc := func(service *registry.Service) error {
+		var regErr error
+
+		for i := 0; i < 3; i++ {
+			// set the ttl and namespace
+			rOpts := []registry.RegisterOption{
+				registry.RegisterTTL(config.RegisterTTL),
+				registry.RegisterDomain(g.opts.Namespace),
+			}
+
+			// attempt to register
+			if err := config.Registry.Register(service, rOpts...); err != nil {
+				// set the error
+				regErr = err
+				// backoff then retry
+				time.Sleep(backoff.Do(i + 1))
+				continue
+			}
+			// success so nil error
+			regErr = nil
+			break
+		}
+
+		return regErr
+	}
+
+	// if service already filled, reuse it and return early
+	if rsvc != nil {
+		if err := regFunc(rsvc); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	var err error
+	var advt, host, port string
+	var cacheService bool
 
 	// check the advertise address first
 	// if it exists then use it, otherwise
@@ -558,12 +649,18 @@ func (g *grpcServer) Register() error {
 		advt = config.Address
 	}
 
-	parts := strings.Split(advt, ":")
-	if len(parts) > 1 {
-		host = strings.Join(parts[:len(parts)-1], ":")
-		port, _ = strconv.Atoi(parts[len(parts)-1])
+	if cnt := strings.Count(advt, ":"); cnt >= 1 {
+		// ipv6 address in format [host]:port or ipv4 host:port
+		host, port, err = net.SplitHostPort(advt)
+		if err != nil {
+			return err
+		}
 	} else {
-		host = parts[0]
+		host = advt
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		cacheService = true
 	}
 
 	addr, err := addr.Extract(host)
@@ -571,19 +668,21 @@ func (g *grpcServer) Register() error {
 		return err
 	}
 
+	// make copy of metadata
+	md := meta.Copy(config.Metadata)
+
 	// register service
 	node := &registry.Node{
 		Id:       config.Name + "-" + config.Id,
-		Address:  addr,
-		Port:     port,
-		Metadata: config.Metadata,
+		Address:  mnet.HostPort(addr, port),
+		Metadata: md,
 	}
 
 	node.Metadata["broker"] = config.Broker.String()
 	node.Metadata["registry"] = config.Registry.String()
 	node.Metadata["server"] = g.String()
 	node.Metadata["transport"] = g.String()
-	// node.Metadata["transport"] = config.Transport.String()
+	node.Metadata["protocol"] = "grpc"
 
 	g.RLock()
 	// Maps are ordered randomly, sort the keys for consistency
@@ -607,7 +706,7 @@ func (g *grpcServer) Register() error {
 		return subscriberList[i].topic > subscriberList[j].topic
 	})
 
-	var endpoints []*registry.Endpoint
+	endpoints := make([]*registry.Endpoint, 0, len(handlerList)+len(subscriberList))
 	for _, n := range handlerList {
 		endpoints = append(endpoints, g.handlers[n].Endpoints()...)
 	}
@@ -623,18 +722,18 @@ func (g *grpcServer) Register() error {
 		Endpoints: endpoints,
 	}
 
-	g.Lock()
+	g.RLock()
 	registered := g.registered
-	g.Unlock()
+	g.RUnlock()
 
 	if !registered {
-		log.Logf("Registering node: %s", node.Id)
+		if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+			logger.Infof("Registry [%s] Registering node: %s", config.Registry.String(), node.Id)
+		}
 	}
 
-	// create registry options
-	rOpts := []registry.RegisterOption{registry.RegisterTTL(config.RegisterTTL)}
-
-	if err := config.Registry.Register(service, rOpts...); err != nil {
+	// register the service
+	if err := regFunc(service); err != nil {
 		return err
 	}
 
@@ -646,13 +745,19 @@ func (g *grpcServer) Register() error {
 	g.Lock()
 	defer g.Unlock()
 
-	g.registered = true
-
-	for sb, _ := range g.subscribers {
+	for sb := range g.subscribers {
 		handler := g.createSubHandler(sb, g.opts)
 		var opts []broker.SubscribeOption
 		if queue := sb.Options().Queue; len(queue) > 0 {
 			opts = append(opts, broker.Queue(queue))
+		}
+
+		if cx := sb.Options().Context; cx != nil {
+			opts = append(opts, broker.SubscribeContext(cx))
+		}
+
+		if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+			logger.Infof("Subscribing to topic: %s", sb.Topic())
 		}
 		sub, err := config.Broker.Subscribe(sb.Topic(), handler, opts...)
 		if err != nil {
@@ -661,13 +766,26 @@ func (g *grpcServer) Register() error {
 		g.subscribers[sb] = []broker.Subscriber{sub}
 	}
 
+	g.registered = true
+	if cacheService {
+		g.rsvc = service
+	}
+
 	return nil
 }
 
 func (g *grpcServer) Deregister() error {
+	var err error
+	var advt, host, port string
+
+	g.RLock()
 	config := g.opts
-	var advt, host string
-	var port int
+	g.RUnlock()
+
+	// only register if it exists or is not noop
+	if config.Registry == nil || config.Registry.String() == "noop" {
+		return nil
+	}
 
 	// check the advertise address first
 	// if it exists then use it, otherwise
@@ -678,12 +796,14 @@ func (g *grpcServer) Deregister() error {
 		advt = config.Address
 	}
 
-	parts := strings.Split(advt, ":")
-	if len(parts) > 1 {
-		host = strings.Join(parts[:len(parts)-1], ":")
-		port, _ = strconv.Atoi(parts[len(parts)-1])
+	if cnt := strings.Count(advt, ":"); cnt >= 1 {
+		// ipv6 address in format [host]:port or ipv4 host:port
+		host, port, err = net.SplitHostPort(advt)
+		if err != nil {
+			return err
+		}
 	} else {
-		host = parts[0]
+		host = advt
 	}
 
 	addr, err := addr.Extract(host)
@@ -693,8 +813,7 @@ func (g *grpcServer) Deregister() error {
 
 	node := &registry.Node{
 		Id:      config.Name + "-" + config.Id,
-		Address: addr,
-		Port:    port,
+		Address: mnet.HostPort(addr, port),
 	}
 
 	service := &registry.Service{
@@ -703,12 +822,17 @@ func (g *grpcServer) Deregister() error {
 		Nodes:   []*registry.Node{node},
 	}
 
-	log.Logf("Deregistering node: %s", node.Id)
-	if err := config.Registry.Deregister(service); err != nil {
+	if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+		logger.Infof("Deregistering node: %s", node.Id)
+	}
+
+	opt := registry.DeregisterDomain(g.opts.Namespace)
+	if err := config.Registry.Deregister(service, opt); err != nil {
 		return err
 	}
 
 	g.Lock()
+	g.rsvc = nil
 
 	if !g.registered {
 		g.Unlock()
@@ -717,59 +841,197 @@ func (g *grpcServer) Deregister() error {
 
 	g.registered = false
 
+	wg := sync.WaitGroup{}
 	for sb, subs := range g.subscribers {
 		for _, sub := range subs {
-			log.Logf("Unsubscribing from topic: %s", sub.Topic())
-			sub.Unsubscribe()
+			wg.Add(1)
+			go func(s broker.Subscriber) {
+				defer wg.Done()
+				if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+					logger.Infof("Unsubscribing from topic: %s", s.Topic())
+				}
+				s.Unsubscribe()
+			}(sub)
 		}
 		g.subscribers[sb] = nil
 	}
+	wg.Wait()
 
 	g.Unlock()
 	return nil
 }
 
 func (g *grpcServer) Start() error {
-	registerDebugHandler(g)
-	config := g.opts
+	g.RLock()
+	if g.started {
+		g.RUnlock()
+		return nil
+	}
+	g.RUnlock()
+
+	config := g.Options()
 
 	// micro: config.Transport.Listen(config.Address)
-	ts, err := net.Listen("tcp", config.Address)
-	if err != nil {
-		return err
+	var ts net.Listener
+
+	if l := g.getListener(); l != nil {
+		ts = l
+	} else {
+		var err error
+
+		// check the tls config for secure connect
+		if tc := config.TLSConfig; tc != nil {
+			ts, err = tls.Listen("tcp", config.Address, tc)
+			// otherwise just plain tcp listener
+		} else {
+			ts, err = net.Listen("tcp", config.Address)
+		}
+		if err != nil {
+			return err
+		}
 	}
 
-	log.Logf("Listening on %s", ts.Addr().String())
+	if g.opts.Context != nil {
+		if c, ok := g.opts.Context.Value(maxConnKey{}).(int); ok && c > 0 {
+			ts = netutil.LimitListener(ts, c)
+		}
+	}
+
+	if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+		logger.Infof("Server [grpc] Listening on %s", ts.Addr().String())
+	}
 	g.Lock()
 	g.opts.Address = ts.Addr().String()
 	g.Unlock()
 
+	// only connect if we're subscribed
+	if len(g.subscribers) > 0 {
+		// connect to the broker
+		if err := config.Broker.Connect(); err != nil {
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				logger.Errorf("Broker [%s] connect error: %v", config.Broker.String(), err)
+			}
+			return err
+		}
+
+		if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+			logger.Infof("Broker [%s] Connected to %s", config.Broker.String(), config.Broker.Address())
+		}
+	}
+
+	// announce self to the world
+	if err := g.Register(); err != nil {
+		if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+			logger.Errorf("Server register error: %v", err)
+		}
+	}
+
 	// micro: go ts.Accept(s.accept)
-	go g.serve(ts)
+	go func() {
+		if err := g.srv.Serve(ts); err != nil {
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				logger.Errorf("gRPC Server start error: %v", err)
+			}
+		}
+	}()
 
 	go func() {
-		// wait for exit
-		ch := <-g.exit
+		t := new(time.Ticker)
+
+		// only process if it exists
+		if g.opts.RegisterInterval > time.Duration(0) {
+			// new ticker
+			t = time.NewTicker(g.opts.RegisterInterval)
+		}
+
+		// return error chan
+		var ch chan error
+
+	Loop:
+		for {
+			select {
+			// register self on interval
+			case <-t.C:
+				if err := g.Register(); err != nil {
+					if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+						logger.Error("Server register error: ", err)
+					}
+				}
+			// wait for exit
+			case ch = <-g.exit:
+				break Loop
+			}
+		}
+
+		// deregister self
+		if err := g.Deregister(); err != nil {
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				logger.Error("Server deregister error: ", err)
+			}
+		}
 
 		// wait for waitgroup
-		if wait(g.opts.Context) {
+		if g.wg != nil {
 			g.wg.Wait()
 		}
 
-		// close transport
-		ch <- ts.Close()
+		// stop the grpc server
+		exit := make(chan bool)
 
+		go func() {
+			g.srv.GracefulStop()
+			close(exit)
+		}()
+
+		select {
+		case <-exit:
+		case <-time.After(time.Second):
+			g.srv.Stop()
+		}
+
+		// close transport
+		ch <- nil
+
+		if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+			logger.Infof("Broker [%s] Disconnected from %s", config.Broker.String(), config.Broker.Address())
+		}
 		// disconnect broker
-		config.Broker.Disconnect()
+		if err := config.Broker.Disconnect(); err != nil {
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				logger.Errorf("Broker [%s] disconnect error: %v", config.Broker.String(), err)
+			}
+		}
 	}()
 
-	return config.Broker.Connect()
+	// mark the server as started
+	g.Lock()
+	g.started = true
+	g.Unlock()
+
+	return nil
 }
 
 func (g *grpcServer) Stop() error {
+	g.RLock()
+	if !g.started {
+		g.RUnlock()
+		return nil
+	}
+	g.RUnlock()
+
 	ch := make(chan error)
 	g.exit <- ch
-	return <-ch
+
+	var err error
+	select {
+	case err = <-ch:
+		g.Lock()
+		g.rsvc = nil
+		g.started = false
+		g.Unlock()
+	}
+
+	return err
 }
 
 func (g *grpcServer) String() string {

@@ -8,19 +8,19 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"strconv"
 	"testing"
 
-	"github.com/micro/go-micro/client"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/selector"
-	"github.com/micro/go-plugins/client/http/test"
-	"github.com/micro/go-plugins/registry/memory"
+	"github.com/micro/go-micro/v2/client"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/registry/memory"
+	"github.com/micro/go-micro/v2/router"
+	rrouter "github.com/micro/go-micro/v2/router/registry"
+	"github.com/micro/go-plugins/client/http/v2/test"
 )
 
 func TestHTTPClient(t *testing.T) {
 	r := memory.NewRegistry()
-	s := selector.NewSelector(selector.Registry(r))
+	s := rrouter.NewRouter(router.Registry(r))
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -68,26 +68,22 @@ func TestHTTPClient(t *testing.T) {
 	})
 	go http.Serve(l, mux)
 
-	host, sport, err := net.SplitHostPort(l.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	port, _ := strconv.Atoi(sport)
-
 	if err := r.Register(&registry.Service{
 		Name: "test.service",
 		Nodes: []*registry.Node{
 			{
 				Id:      "test.service.1",
-				Address: host,
-				Port:    port,
+				Address: l.Addr().String(),
+				Metadata: map[string]string{
+					"protocol": "http",
+				},
 			},
 		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	c := NewClient(client.Selector(s))
+	c := NewClient(client.Router(s))
 
 	for i := 0; i < 10; i++ {
 		msg := &test.Message{
@@ -108,7 +104,7 @@ func TestHTTPClient(t *testing.T) {
 
 func TestHTTPClientStream(t *testing.T) {
 	r := memory.NewRegistry()
-	s := selector.NewSelector(selector.Registry(r))
+	s := rrouter.NewRouter(router.Registry(r))
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -231,26 +227,22 @@ func TestHTTPClientStream(t *testing.T) {
 	})
 	go http.Serve(l, mux)
 
-	host, sport, err := net.SplitHostPort(l.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	port, _ := strconv.Atoi(sport)
-
 	if err := r.Register(&registry.Service{
 		Name: "test.service",
 		Nodes: []*registry.Node{
 			{
 				Id:      "test.service.1",
-				Address: host,
-				Port:    port,
+				Address: l.Addr().String(),
+				Metadata: map[string]string{
+					"protocol": "http",
+				},
 			},
 		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	c := NewClient(client.Selector(s))
+	c := NewClient(client.Router(s))
 	req := c.NewRequest("test.service", "/foo/bar", new(test.Message))
 	stream, err := c.Stream(context.TODO(), req)
 	if err != nil {

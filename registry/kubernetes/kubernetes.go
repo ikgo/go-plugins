@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/micro/go-plugins/registry/kubernetes/client"
+	"github.com/micro/go-plugins/registry/kubernetes/v2/client"
 
-	"github.com/micro/go-micro/cmd"
-	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/v2/cmd"
+	"github.com/micro/go-micro/v2/registry"
 )
 
 type kregistry struct {
@@ -51,6 +51,35 @@ func init() {
 	cmd.DefaultRegistries["kubernetes"] = NewRegistry
 }
 
+func configure(k *kregistry, opts ...registry.Option) error {
+	for _, o := range opts {
+		o(&k.options)
+	}
+
+	// get first host
+	var host string
+	if len(k.options.Addrs) > 0 && len(k.options.Addrs[0]) > 0 {
+		host = k.options.Addrs[0]
+	}
+
+	if k.options.Timeout == 0 {
+		k.options.Timeout = time.Second * 1
+	}
+
+	// if no hosts setup, assume InCluster
+	var c client.Kubernetes
+	if len(host) == 0 {
+		c = client.NewClientInCluster()
+	} else {
+		c = client.NewClientByHost(host)
+	}
+
+	k.client = c
+	k.timeout = k.options.Timeout
+
+	return nil
+}
+
 // serviceName generates a valid service name for k8s labels
 func serviceName(name string) string {
 	aname := make([]byte, len(name))
@@ -64,6 +93,11 @@ func serviceName(name string) string {
 	}
 
 	return string(aname)
+}
+
+// Init allows reconfig of options
+func (c *kregistry) Init(opts ...registry.Option) error {
+	return configure(c, opts...)
 }
 
 // Options returns the registry Options
@@ -110,7 +144,7 @@ func (c *kregistry) Register(s *registry.Service, opts ...registry.RegisterOptio
 }
 
 // Deregister nils out any things set in Register
-func (c *kregistry) Deregister(s *registry.Service) error {
+func (c *kregistry) Deregister(s *registry.Service, opts ...registry.DeregisterOption) error {
 	if len(s.Nodes) == 0 {
 		return errors.New("you must deregister at least one node")
 	}
@@ -140,7 +174,7 @@ func (c *kregistry) Deregister(s *registry.Service) error {
 
 // GetService will get all the pods with the given service selector,
 // and build services from the annotations.
-func (c *kregistry) GetService(name string) ([]*registry.Service, error) {
+func (c *kregistry) GetService(name string, opts ...registry.GetOption) ([]*registry.Service, error) {
 	pods, err := c.client.ListPods(map[string]string{
 		svcSelectorPrefix + serviceName(name): svcSelectorValue,
 	})
@@ -183,7 +217,7 @@ func (c *kregistry) GetService(name string) ([]*registry.Service, error) {
 		vs.Nodes = append(vs.Nodes, svc.Nodes...)
 	}
 
-	var list []*registry.Service
+	list := make([]*registry.Service, 0, len(svcs))
 	for _, val := range svcs {
 		list = append(list, val)
 	}
@@ -191,7 +225,7 @@ func (c *kregistry) GetService(name string) ([]*registry.Service, error) {
 }
 
 // ListServices will list all the service names
-func (c *kregistry) ListServices() ([]*registry.Service, error) {
+func (c *kregistry) ListServices(opts ...registry.ListOption) ([]*registry.Service, error) {
 	pods, err := c.client.ListPods(podSelector)
 	if err != nil {
 		return nil, err
@@ -237,33 +271,9 @@ func (c *kregistry) String() string {
 
 // NewRegistry creates a kubernetes registry
 func NewRegistry(opts ...registry.Option) registry.Registry {
-
-	var options registry.Options
-	for _, o := range opts {
-		o(&options)
+	k := &kregistry{
+		options: registry.Options{},
 	}
-
-	// get first host
-	var host string
-	if len(options.Addrs) > 0 && len(options.Addrs[0]) > 0 {
-		host = options.Addrs[0]
-	}
-
-	if options.Timeout == 0 {
-		options.Timeout = time.Second * 1
-	}
-
-	// if no hosts setup, assume InCluster
-	var c client.Kubernetes
-	if len(host) == 0 {
-		c = client.NewClientInCluster()
-	} else {
-		c = client.NewClientByHost(host)
-	}
-
-	return &kregistry{
-		client:  c,
-		options: options,
-		timeout: options.Timeout,
-	}
+	configure(k, opts...)
+	return k
 }

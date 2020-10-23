@@ -6,16 +6,15 @@ import (
 	"crypto/tls"
 	"net"
 
-	"github.com/micro/go-micro/cmd"
-	"github.com/micro/go-micro/transport"
-	maddr "github.com/micro/util/go/lib/addr"
-	mnet "github.com/micro/util/go/lib/net"
-	mls "github.com/micro/util/go/lib/tls"
+	"github.com/asim/go-micro/v3/transport"
+	maddr "github.com/asim/go-micro/v3/util/addr"
+	mnet "github.com/asim/go-micro/v3/util/net"
+	mls "github.com/asim/go-micro/v3/util/tls"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
-	pb "github.com/micro/go-plugins/transport/grpc/proto"
+	pb "github.com/asim/go-plugins/transport/grpc/v3/proto"
 )
 
 type grpcTransport struct {
@@ -26,10 +25,6 @@ type grpcTransportListener struct {
 	listener net.Listener
 	secure   bool
 	tls      *tls.Config
-}
-
-func init() {
-	cmd.DefaultTransports["grpc"] = NewTransport
 }
 
 func getTLSConfig(addr string) (*tls.Config, error) {
@@ -84,7 +79,7 @@ func (t *grpcTransportListener) Accept(fn func(transport.Socket)) error {
 	srv := grpc.NewServer(opts...)
 
 	// register service
-	pb.RegisterTransportServer(srv, &microTransport{fn: fn})
+	pb.RegisterTransportServer(srv, &microTransport{addr: t.listener.Addr().String(), fn: fn})
 
 	// start serving
 	return srv.Serve(t.listener)
@@ -99,9 +94,7 @@ func (t *grpcTransport) Dial(addr string, opts ...transport.DialOption) (transpo
 		opt(&dopts)
 	}
 
-	options := []grpc.DialOption{
-		grpc.WithTimeout(dopts.Timeout),
-	}
+	options := []grpc.DialOption{}
 
 	if t.opts.Secure || t.opts.TLSConfig != nil {
 		config := t.opts.TLSConfig
@@ -117,7 +110,9 @@ func (t *grpcTransport) Dial(addr string, opts ...transport.DialOption) (transpo
 	}
 
 	// dial the server
-	conn, err := grpc.Dial(addr, options...)
+	ctx, cancel := context.WithTimeout(context.Background(), dopts.Timeout)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, addr, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +127,8 @@ func (t *grpcTransport) Dial(addr string, opts ...transport.DialOption) (transpo
 	return &grpcTransportClient{
 		conn:   conn,
 		stream: stream,
+		local:  "localhost",
+		remote: addr,
 	}, nil
 }
 
@@ -153,6 +150,17 @@ func (t *grpcTransport) Listen(addr string, opts ...transport.ListenOption) (tra
 		tls:      t.opts.TLSConfig,
 		secure:   t.opts.Secure,
 	}, nil
+}
+
+func (t *grpcTransport) Init(opts ...transport.Option) error {
+	for _, o := range opts {
+		o(&t.opts)
+	}
+	return nil
+}
+
+func (t *grpcTransport) Options() transport.Options {
+	return t.opts
 }
 
 func (t *grpcTransport) String() string {
